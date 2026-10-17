@@ -278,8 +278,12 @@ pub struct Endpoint<R: CryptoRng> {
     /// Connections `poll_transmit` has visited.
     #[cfg(test)]
     pub(crate) visits: u64,
-    /// Test-only oracle: `poll_transmit` takes a turn of every connection, as before the ready
-    /// set (`diff_tests`).
+    /// Connections `handle_timeout` has processed.
+    #[cfg(test)]
+    pub(crate) timeouts: u64,
+    /// Test-only oracle: `poll_transmit` takes a turn of every connection, and `poll_timeout`
+    /// and `handle_timeout` look at every connection, as before the ready set and the deadline
+    /// heap (`diff_tests`).
     #[cfg(test)]
     pub(crate) full_scan: bool,
 }
@@ -311,6 +315,8 @@ impl<R: CryptoRng> Endpoint<R> {
             cc: None,
             #[cfg(test)]
             visits: 0,
+            #[cfg(test)]
+            timeouts: 0,
             #[cfg(test)]
             full_scan: false,
         }
@@ -1408,19 +1414,22 @@ impl<R: CryptoRng> Endpoint<R> {
                 from = Excluded(h);
                 match self.visit(h, now, buf) {
                     Visit::Sent(n) => {
+                        self.conns.touch(h);
                         self.cursor = h.0 + 1;
                         if n.is_some() {
+                            self.conns.refresh_if_many();
                             return n;
                         }
                     }
                     Visit::Idle => {
-                        let wake = wake_at(&self.conns[&h]);
-                        self.conns.park(h, wake);
+                        let deadline = next_deadline(&self.conns[&h]);
+                        self.conns.park(h, deadline);
                     }
-                    Visit::Busy => {}
+                    Visit::Busy => self.conns.touch(h),
                 }
             }
         }
+        self.conns.refresh();
         None
     }
 
@@ -1554,7 +1563,12 @@ impl<R: CryptoRng> Endpoint<R> {
     /// Earliest `poll_send_at` over all connections. Driver contract: after any `read`,
     /// `write` or `close` call `poll_transmit` (they can make a packet due), then re-read this.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        (self.conns.values().filter_map(next_deadline))
+        #[cfg(test)]
+        if self.full_scan {
+            let all = self.conns.iter().filter_map(|(_, c)| next_deadline(c));
+            return all.chain(self.aborted.next_expiry()).min();
+        }
+        (self.conns.next_timer().into_iter())
             .chain(self.aborted.next_expiry())
             .min()
     }
@@ -1565,10 +1579,23 @@ impl<R: CryptoRng> Endpoint<R> {
     pub fn handle_timeout(&mut self, now: Instant) {
         self.apply_aborts(now);
         self.aborted.expire(now);
-        let mut reached = Vec::new();
-        for (&h, c) in self.conns.iter_untracked_mut().filter(|(_, c)| !c.detached) {
-            if c.slot.take_pending() {
-                reached.push(h);
+        self.conns.refresh();
+        // The connections with a deadline at or before `now`, and those changed since their
+        // last pass here: any other would change nothing.
+        let due = self.conns.due(now);
+        #[cfg(test)]
+        let due = match self.full_scan {
+            true => self.conns.iter().map(|(&h, _)| h).collect(),
+            false => due,
+        };
+        for &h in &due {
+            let c = self.conns.untracked_mut(&h).unwrap();
+            if c.detached {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.timeouts += 1;
             }
             let mark = self.events.len();
             c.update_recovery(now);
@@ -1647,16 +1674,11 @@ impl<R: CryptoRng> Endpoint<R> {
                 self.events.truncate(mark);
             }
             Self::free_ended(&mut self.demux, &mut self.listeners, h, c);
-        }
-        // A pass may act on what an endpoint call did to the connection since its last pass
-        // (a timer it armed, a close to report), so that connection is ready again. One whose
-        // timer fired here is woken by its deadline at the next `poll_transmit` (`Conns::wake`).
-        for h in reached {
             self.conns.passed(h);
         }
         let (demux, events) = (&mut self.demux, &mut self.events);
         let (listeners, tokens) = (&mut self.listeners, &mut self.tokens);
-        self.conns.retain(|&h, c| {
+        self.conns.retain_some(&due, |&h, c| {
             // A half-open connection is never retained nor detached: no application holds it
             // (spec G10), and keeping it would bypass `max_half_open` (spec G9).
             let retained = !c.half_open && c.hooks.retained();
@@ -1686,6 +1708,7 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             c.detached
         });
+        self.conns.refresh();
     }
 }
 
@@ -1785,13 +1808,14 @@ fn tcb_states(c: &Connection) -> u64 {
     })
 }
 
-/// When the passing of time alone may give `c` something to send: its deadline, or a pacing
-/// release, which the deadline leaves out when nothing it knows of waits for it.
-fn wake_at(c: &Connection) -> Option<Instant> {
+/// When the passing of time alone may give `c` something to send: its deadline (`deadline`,
+/// from `next_deadline`), or a pacing release, which the deadline leaves out when nothing it
+/// knows of waits for it.
+fn wake_at(c: &Connection, deadline: Option<Instant>) -> Option<Instant> {
     let release = (c.subflows.iter())
         .filter_map(|sf| sf.tcb.release_at())
         .min();
-    next_deadline(c).into_iter().chain(release).min()
+    deadline.into_iter().chain(release).min()
 }
 
 /// Some subflow of `c` is in TIME-WAIT.

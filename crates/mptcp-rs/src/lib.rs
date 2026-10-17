@@ -40,9 +40,10 @@
 //! handle; before it the connection has no handle. MP_CAPABLE and MP_JOIN are answered, and a
 //! client's MP_JOIN, MP_PRIO and REMOVE_ADDR work as on the client side. Server limits: no SYN
 //! cookies, so SYNs beyond `max_half_open` half-open connections are dropped silently; the
-//! server sends no ADD_ADDR; and, as on the client side, the timer path scans every
-//! connection of the endpoint, so its cost grows with the number of connections
-//! ([`Endpoint::poll_transmit`] visits only those that may have something to send).
+//! server sends no ADD_ADDR. [`Endpoint::poll_transmit`] visits only the connections that
+//! may have something to send, and [`Endpoint::poll_timeout`] and
+//! [`Endpoint::handle_timeout`] only those that an endpoint call reached or whose deadline
+//! passed.
 //!
 //! DSS checksums (A=1) are on by default (`ConnectConfig::checksums`), with MP_FAIL. Not
 //! implemented yet: RACK-TLP. Known limitations: an application with no data left to send can

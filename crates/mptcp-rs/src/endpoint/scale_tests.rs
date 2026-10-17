@@ -18,6 +18,8 @@ struct Pair {
     wire: BTreeMap<(Instant, u64), (bool, Vec<u8>)>,
     n: u64,
     packets: u64,
+    /// `handle_timeout` calls.
+    timeouts: u64,
     accepted: Vec<ConnectionHandle>,
 }
 
@@ -36,6 +38,7 @@ impl Pair {
             wire: BTreeMap::new(),
             n: 0,
             packets: 0,
+            timeouts: 0,
             accepted: Vec::new(),
         }
     }
@@ -89,6 +92,7 @@ impl Pair {
         for ep in [&mut self.a, &mut self.b] {
             if ep.poll_timeout().is_some_and(|t| t <= self.now) {
                 ep.handle_timeout(self.now);
+                self.timeouts += 1;
             }
         }
         true
@@ -99,6 +103,55 @@ impl Pair {
         while self.step(until) {}
         self.now = until;
     }
+}
+
+/// `n` idle MPTCP connections, then one transfer of `len` octets from the client: returns the
+/// connections `handle_timeout` processed per call during the transfer.
+fn timeouts_per_call(n: usize, len: usize) -> f64 {
+    let mut p = Pair::new(n + 1);
+    for _ in 0..n {
+        p.connect();
+    }
+    p.run_for(Duration::from_secs(1));
+    assert_eq!(p.accepted.len(), n, "every idle connection is accepted");
+    let h = p.connect();
+    p.run_for(Duration::from_millis(100));
+    // A changed connection gets one pass even if not due: the first call after the
+    // handshakes takes them all, once.
+    for ep in [&mut p.a, &mut p.b] {
+        ep.handle_timeout(p.now);
+    }
+    let server_h = *p.accepted.last().unwrap();
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let (processed, calls) = (p.a.timeouts + p.b.timeouts, p.timeouts);
+    let (mut written, mut received) = (0, Vec::new());
+    let mut buf = vec![0u8; 65536];
+    while received.len() < len {
+        if written < len {
+            written += p.a.connection(h).unwrap().write(&data[written..]).unwrap();
+        }
+        let until = p.now + Duration::from_secs(10);
+        assert!(p.step(until), "the transfer stalled");
+        while let Ok(k) = p.b.connection(server_h).unwrap().read(&mut buf) {
+            received.extend_from_slice(&buf[..k]);
+        }
+    }
+    assert!(received == data);
+    let processed = p.a.timeouts + p.b.timeouts - processed;
+    processed as f64 / (p.timeouts - calls) as f64
+}
+
+#[test]
+fn idle_connections_do_not_slow_timeouts() {
+    // Processing every connection made this the number of connections per call (issue #12);
+    // with the deadline heap it is the due and changed ones only.
+    let few = timeouts_per_call(1, 300_000);
+    let many = timeouts_per_call(2000, 300_000);
+    assert!(
+        many < 3.0,
+        "{many} connections per call with 2000 idle connections"
+    );
+    assert!(many < few + 0.5, "{many} vs {few} with one idle connection");
 }
 
 /// `n` idle MPTCP connections, then one transfer of `len` octets from the client: returns the
