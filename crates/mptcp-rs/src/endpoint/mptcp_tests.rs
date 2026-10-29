@@ -3470,6 +3470,49 @@ fn release() -> Instant {
 }
 
 #[test]
+fn closed_subflow_does_not_wake_idle_connection() {
+    let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, None);
+    open_window(&mut ep, &syn, h);
+    // Give CUBIC a nonzero RTT before arming its pacing release.
+    let head = una(&ep, h);
+    ep.connection(h).unwrap().write(&[1; 1432]).unwrap();
+    let initial = drain(&mut ep, T0);
+    let first = packet::parse(&initial[0]).unwrap();
+    let sent_at = T0 + Duration::from_millis(10);
+    peer_ack(
+        &mut ep,
+        &syn,
+        sent_at,
+        first.seq.wrapping_add(1432),
+        head + 1432,
+        1000,
+    );
+    ep.connection(h).unwrap().write(&[1; 32_000]).unwrap();
+    drain(&mut ep, sent_at);
+    assert!(ep.conns[&h].subflows[0].tcb.release_at().is_some());
+    // The initial subflow remains while MPTCP waits for a replacement path.
+    let reset = Segment {
+        flags: TcpFlags::RST | TcpFlags::ACK,
+        ..peer_data(&syn, 5001, &[], &[])
+    };
+    let mut buf = [0u8; 1500];
+    let n = packet::build(&reset, 0, &mut buf).unwrap();
+    ep.handle_packet(sent_at + Duration::from_millis(1), &buf[..n]);
+    assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
+    let now = T0 + Duration::from_millis(100);
+    drain(&mut ep, now);
+    for _ in 0..100 {
+        assert!(ep.poll_transmit(now, &mut buf).is_none());
+    }
+    let slot = &ep.conns[&h].slot;
+    assert!(slot.idle);
+    assert!(
+        slot.wake.is_none_or(|at| at > now),
+        "a closed TCB must not expire the idle cache"
+    );
+}
+
+#[test]
 fn endpoint_poll_timeout_wakes_paced_subflow() {
     let (mut ep, _, syn, head, first) = paced_first_segment(3 * 1432);
     let first = packet::parse(&first).unwrap();

@@ -58,6 +58,10 @@ impl Conns {
 
     pub fn remove(&mut self, h: &ConnectionHandle) -> Option<Connection> {
         let c = self.map.remove(h);
+        // Half-opens can be removed before any timer fires, so `due` may never drain these.
+        if self.pending.len() > 2 * self.map.len() + 64 {
+            self.pending.retain(|h| self.map.contains_key(h));
+        }
         self.settle();
         c
     }
@@ -269,7 +273,7 @@ impl Conns {
     /// call, in handle order. The caller marks each again as it processes it.
     pub fn due(&mut self, now: Instant) -> Vec<ConnectionHandle> {
         let mut due = std::mem::take(&mut self.pending);
-        // Freed connections stay listed until here.
+        // Freed connections may stay listed until here.
         due.retain(|h| {
             let c = self.map.get_mut(h);
             c.map(|c| c.slot.pending = false).is_some()
@@ -324,5 +328,63 @@ impl Index<&ConnectionHandle> for Conns {
 
     fn index(&self, h: &ConnectionHandle) -> &Connection {
         &self.map[h]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::seq::SeqNum;
+    use crate::wire::packet::{self, Segment, TcpFlags};
+    use crate::{Endpoint, ListenConfig};
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
+
+    #[test]
+    fn cancelled_half_opens_bound_pending_without_timeouts() {
+        let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
+        let dst = "10.0.0.2:80".parse().unwrap();
+        ep.listen(
+            dst,
+            ListenConfig {
+                max_half_open: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let syn = Segment {
+            src: "10.0.0.1:40000".parse().unwrap(),
+            dst,
+            seq: SeqNum(1000),
+            ack: SeqNum(0),
+            flags: TcpFlags::SYN,
+            wnd: 65535,
+            options: &[],
+            payload: &[],
+        };
+        let mut buf = [0u8; 1500];
+        for i in 0..10_000 {
+            let now = Instant::from_nanos(i * 10_000_000);
+            let n = packet::build(&syn, 0, &mut buf).unwrap();
+            ep.handle_packet(now, &buf[..n]);
+            assert!(ep.poll_transmit(now, &mut buf).is_some());
+            assert!(ep.poll_transmit(now, &mut buf).is_none());
+            let rst = Segment {
+                seq: SeqNum(1001),
+                flags: TcpFlags::RST,
+                ..syn
+            };
+            let n = packet::build(&rst, 0, &mut buf).unwrap();
+            let now = Instant::from_nanos(i * 10_000_000 + 1_000_000);
+            ep.handle_packet(now, &buf[..n]);
+            assert!(ep.poll_transmit(now, &mut buf).is_none());
+            assert!(ep.conns.is_empty());
+            assert_eq!(ep.poll_timeout(), None);
+        }
+        assert!(
+            ep.conns.pending.len() <= 64,
+            "{} pending handles with no connections or timers",
+            ep.conns.pending.len()
+        );
     }
 }
