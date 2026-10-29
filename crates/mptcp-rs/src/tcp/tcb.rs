@@ -1296,6 +1296,10 @@ impl Tcb {
     /// The pacing release, if one is set: data and FINs held back for it may go once it
     /// passes, also those `poll_send_at` leaves it out for (a go-back's lone FIN).
     pub(crate) fn release_at(&self) -> Option<Instant> {
+        // Closed and TIME-WAIT TCBs never consume a pacing release.
+        if matches!(self.state, TcpState::Closed | TcpState::TimeWait) {
+            return None;
+        }
         self.next_send_at
     }
 
